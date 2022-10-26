@@ -18,14 +18,17 @@ package scheduler
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"reflect"
+	"strconv"
 	"testing"
 	"time"
 
 	"github.com/golang/mock/gomock"
 	"github.com/google/uuid"
+	"github.com/sjwhitworth/golearn/base"
 	"github.com/stretchr/testify/assert"
 
 	commonv1 "d7y.io/api/pkg/apis/common/v1"
@@ -39,6 +42,7 @@ import (
 	configmocks "d7y.io/dragonfly/v2/scheduler/config/mocks"
 	"d7y.io/dragonfly/v2/scheduler/resource"
 	"d7y.io/dragonfly/v2/scheduler/scheduler/evaluator"
+	"d7y.io/dragonfly/v2/scheduler/training/models"
 )
 
 var (
@@ -48,7 +52,7 @@ var (
 		RetryBackSourceLimit: 1,
 		RetryInterval:        10 * time.Millisecond,
 		BackSourceCount:      int(mockTaskBackToSourceLimit),
-		Algorithm:            evaluator.DefaultAlgorithm,
+		Algorithm:            evaluator.MLAlgorithm,
 	}
 	mockRawHost = &schedulerv1.PeerHost{
 		Id:             idgen.HostID("hostname", 8003),
@@ -89,7 +93,30 @@ var (
 	mockTaskID                      = idgen.TaskID(mockTaskURL, mockTaskURLMeta)
 	mockPeerID                      = idgen.PeerID("127.0.0.1")
 	mockSeedPeerID                  = idgen.SeedPeerID("127.0.0.1")
+	mockModel                       = &models.LinearRegression{
+		Fitted:                 true,
+		Disturbance:            0.1,
+		RegressionCoefficients: genRegressionCoefficients(),
+		Attrs:                  genAttrs(),
+		Cls:                    base.NewFloatAttribute("15"),
+	}
 )
+
+func genRegressionCoefficients() []float64 {
+	arr := make([]float64, 15)
+	for i := 0; i < 15; i++ {
+		arr[i] = 0.01
+	}
+	return arr
+}
+
+func genAttrs() []*base.FloatAttribute {
+	arr := make([]*base.FloatAttribute, 15)
+	for i := 0; i < 15; i++ {
+		arr[i] = base.NewFloatAttribute(strconv.Itoa(i))
+	}
+	return arr
+}
 
 func TestScheduler_New(t *testing.T) {
 	tests := []struct {
@@ -121,7 +148,7 @@ func TestScheduler_New(t *testing.T) {
 			defer ctl.Finish()
 			dynconfig := configmocks.NewMockDynconfigInterface(ctl)
 
-			tc.expect(t, New(mockSchedulerConfig, dynconfig, tc.pluginDir))
+			tc.expect(t, New(mockSchedulerConfig, dynconfig, tc.pluginDir, nil, nil))
 		})
 	}
 }
@@ -289,6 +316,11 @@ func TestScheduler_ScheduleParent(t *testing.T) {
 				peer.StoreStream(stream)
 				gomock.InOrder(
 					md.GetSchedulerClusterConfig().Return(types.SchedulerClusterConfig{}, false).Times(1),
+					md.Get().Return(&config.DynconfigData{
+						SchedulerCluster: &config.SchedulerCluster{
+							ID: uint64(1),
+						},
+					}, nil).AnyTimes(),
 					md.GetSchedulerClusterClientConfig().Return(types.SchedulerClusterClientConfig{
 						ParallelCount: 2,
 					}, true).Times(1),
@@ -316,10 +348,31 @@ func TestScheduler_ScheduleParent(t *testing.T) {
 			mockSeedHost := resource.NewHost(mockRawSeedHost, resource.WithHostType(resource.HostTypeSuperSeed))
 			seedPeer := resource.NewPeer(mockSeedPeerID, mockTask, mockSeedHost)
 			blocklist := set.NewSafeSet[string]()
-
+			needVersion := make(chan uint64, 1)
+			modelVersion := make(chan *types.ModelVersion, 1)
 			tc.mock(cancel, peer, seedPeer, blocklist, stream, stream.EXPECT(), dynconfig.EXPECT())
-			scheduler := New(mockSchedulerConfig, dynconfig, mockPluginDir)
+			scheduler := New(mockSchedulerConfig, dynconfig, mockPluginDir, needVersion, modelVersion)
+			go func() {
+				for {
+					select {
+					case <-needVersion:
+						lr := mockModel
+						bytes, _ := json.Marshal(lr)
+						modelVersion <- &types.ModelVersion{
+							Data: bytes,
+							MAE:  1,
+							MSE:  1,
+							RMSE: 1,
+							R2:   1,
+						}
+					case <-ctx.Done():
+						return
+					}
+				}
+			}()
+
 			scheduler.ScheduleParent(ctx, peer, blocklist)
+			ctx.Done()
 			tc.expect(t, peer)
 		})
 	}
@@ -534,6 +587,11 @@ func TestScheduler_NotifyAndFindParent(t *testing.T) {
 				peer.StoreStream(stream)
 				gomock.InOrder(
 					md.GetSchedulerClusterConfig().Return(types.SchedulerClusterConfig{}, false).Times(1),
+					md.Get().Return(&config.DynconfigData{
+						SchedulerCluster: &config.SchedulerCluster{
+							ID: uint64(1),
+						},
+					}, nil).AnyTimes(),
 					md.GetSchedulerClusterClientConfig().Return(types.SchedulerClusterClientConfig{
 						ParallelCount: 2,
 					}, true).Times(1),
@@ -573,6 +631,11 @@ func TestScheduler_NotifyAndFindParent(t *testing.T) {
 				peer.StoreStream(stream)
 				gomock.InOrder(
 					md.GetSchedulerClusterConfig().Return(types.SchedulerClusterConfig{}, false).Times(1),
+					md.Get().Return(&config.DynconfigData{
+						SchedulerCluster: &config.SchedulerCluster{
+							ID: uint64(1),
+						},
+					}, nil).AnyTimes(),
 					md.GetSchedulerClusterClientConfig().Return(types.SchedulerClusterClientConfig{
 						ParallelCount: 2,
 					}, true).Times(1),
@@ -608,10 +671,31 @@ func TestScheduler_NotifyAndFindParent(t *testing.T) {
 				NetTopology:    "net_topology",
 			}))
 			blocklist := set.NewSafeSet[string]()
-
+			needVersion := make(chan uint64, 5)
+			modelVersion := make(chan *types.ModelVersion, 5)
 			tc.mock(peer, mockTask, mockPeer, blocklist, stream, dynconfig, stream.EXPECT(), dynconfig.EXPECT())
-			scheduler := New(mockSchedulerConfig, dynconfig, mockPluginDir)
+			scheduler := New(mockSchedulerConfig, dynconfig, mockPluginDir, needVersion, modelVersion)
+			ctx := context.Background()
+			go func() {
+				for {
+					select {
+					case <-needVersion:
+						lr := mockModel
+						bytes, _ := json.Marshal(lr)
+						modelVersion <- &types.ModelVersion{
+							Data: bytes,
+							MAE:  1,
+							MSE:  1,
+							RMSE: 1,
+							R2:   1,
+						}
+					case <-ctx.Done():
+						return
+					}
+				}
+			}()
 			parents, ok := scheduler.NotifyAndFindParent(context.Background(), peer, blocklist)
+			ctx.Done()
 			tc.expect(t, peer, parents, ok)
 		})
 	}
@@ -729,7 +813,6 @@ func TestScheduler_FindParent(t *testing.T) {
 				mockPeers[1].FinishedPieces.Set(0)
 				mockPeers[1].FinishedPieces.Set(1)
 				mockPeers[1].FinishedPieces.Set(2)
-
 				md.GetSchedulerClusterConfig().Return(types.SchedulerClusterConfig{}, false).Times(1)
 			},
 			expect: func(t *testing.T, peer *resource.Peer, mockPeers []*resource.Peer, parent *resource.Peer, ok bool) {
@@ -754,7 +837,6 @@ func TestScheduler_FindParent(t *testing.T) {
 				mockPeers[1].FinishedPieces.Set(0)
 				mockPeers[1].FinishedPieces.Set(1)
 				mockPeers[1].FinishedPieces.Set(2)
-
 				md.GetSchedulerClusterConfig().Return(types.SchedulerClusterConfig{}, false).Times(1)
 			},
 			expect: func(t *testing.T, peer *resource.Peer, mockPeers []*resource.Peer, parent *resource.Peer, ok bool) {
@@ -776,7 +858,6 @@ func TestScheduler_FindParent(t *testing.T) {
 				mockPeers[1].FinishedPieces.Set(0)
 				mockPeers[1].FinishedPieces.Set(1)
 				mockPeers[1].FinishedPieces.Set(2)
-
 				md.GetSchedulerClusterConfig().Return(types.SchedulerClusterConfig{}, false).Times(1)
 			},
 			expect: func(t *testing.T, peer *resource.Peer, mockPeers []*resource.Peer, parent *resource.Peer, ok bool) {
@@ -807,7 +888,6 @@ func TestScheduler_FindParent(t *testing.T) {
 				mockPeers[1].FinishedPieces.Set(0)
 				mockPeers[1].FinishedPieces.Set(1)
 				mockPeers[1].FinishedPieces.Set(2)
-
 				md.GetSchedulerClusterConfig().Return(types.SchedulerClusterConfig{}, false).Times(1)
 			},
 			expect: func(t *testing.T, peer *resource.Peer, mockPeers []*resource.Peer, parent *resource.Peer, ok bool) {
@@ -852,7 +932,6 @@ func TestScheduler_FindParent(t *testing.T) {
 				mockPeers[1].FinishedPieces.Set(0)
 				mockPeers[1].FinishedPieces.Set(1)
 				mockPeers[1].FinishedPieces.Set(2)
-
 				md.GetSchedulerClusterConfig().Return(types.SchedulerClusterConfig{
 					FilterParentLimit: 3,
 				}, true).Times(1)
@@ -893,7 +972,8 @@ func TestScheduler_FindParent(t *testing.T) {
 
 			blocklist := set.NewSafeSet[string]()
 			tc.mock(peer, mockPeers, blocklist, dynconfig.EXPECT())
-			scheduler := New(mockSchedulerConfig, dynconfig, mockPluginDir)
+			mockSchedulerConfig.Algorithm = "default"
+			scheduler := New(mockSchedulerConfig, dynconfig, mockPluginDir, nil, nil)
 			parent, ok := scheduler.FindParent(context.Background(), peer, blocklist)
 			tc.expect(t, peer, mockPeers, parent, ok)
 		})

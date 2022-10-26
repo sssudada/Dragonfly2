@@ -20,12 +20,13 @@ package scheduler
 
 import (
 	"context"
-	"sort"
 	"time"
 
 	commonv1 "d7y.io/api/pkg/apis/common/v1"
 	schedulerv1 "d7y.io/api/pkg/apis/scheduler/v1"
 
+	logger "d7y.io/dragonfly/v2/internal/dflog"
+	"d7y.io/dragonfly/v2/manager/types"
 	"d7y.io/dragonfly/v2/pkg/container/set"
 	"d7y.io/dragonfly/v2/scheduler/config"
 	"d7y.io/dragonfly/v2/scheduler/resource"
@@ -54,9 +55,9 @@ type scheduler struct {
 	dynconfig config.DynconfigInterface
 }
 
-func New(cfg *config.SchedulerConfig, dynconfig config.DynconfigInterface, pluginDir string) Scheduler {
+func New(cfg *config.SchedulerConfig, dynconfig config.DynconfigInterface, pluginDir string, needVersion chan uint64, modelVersion chan *types.ModelVersion) Scheduler {
 	return &scheduler{
-		evaluator: evaluator.New(cfg.Algorithm, pluginDir),
+		evaluator: evaluator.New(cfg.Algorithm, pluginDir, dynconfig, needVersion, modelVersion),
 		config:    cfg,
 		dynconfig: dynconfig,
 	}
@@ -126,7 +127,7 @@ func (s *scheduler) ScheduleParent(ctx context.Context, peer *resource.Peer, blo
 			peer.Log.Errorf("peer scheduling exceeds the limit %d times and return code %d", s.config.RetryLimit, commonv1.Code_SchedTaskStatusError)
 			return
 		}
-
+		logger.Info("start to schedule parent, come into new function")
 		if _, ok := s.NotifyAndFindParent(ctx, peer, blocklist); !ok {
 			n++
 			peer.Log.Infof("schedule parent %d times failed", n)
@@ -166,13 +167,13 @@ func (s *scheduler) NotifyAndFindParent(ctx context.Context, peer *resource.Peer
 
 	// Sort candidate parents by evaluation score.
 	taskTotalPieceCount := peer.Task.TotalPieceCount.Load()
-	sort.Slice(
-		candidateParents,
-		func(i, j int) bool {
-			return s.evaluator.Evaluate(candidateParents[i], peer, taskTotalPieceCount) > s.evaluator.Evaluate(candidateParents[j], peer, taskTotalPieceCount)
-		},
-	)
-
+	logger.Infof("task piece count is %v", taskTotalPieceCount)
+	candidateParents, err := sortNodes(candidateParents, s.evaluator, peer, taskTotalPieceCount)
+	if err != nil {
+		logger.Errorf("sort nodes error, error is %s", err.Error())
+		// Degrade to base evaluator
+		baseCompute(candidateParents, peer, taskTotalPieceCount)
+	}
 	// Add edges between candidate parent and peer.
 	var (
 		parents   []*resource.Peer
@@ -220,13 +221,12 @@ func (s *scheduler) FindParent(ctx context.Context, peer *resource.Peer, blockli
 
 	// Sort candidate parents by evaluation score.
 	taskTotalPieceCount := peer.Task.TotalPieceCount.Load()
-	sort.Slice(
-		candidateParents,
-		func(i, j int) bool {
-			return s.evaluator.Evaluate(candidateParents[i], peer, taskTotalPieceCount) > s.evaluator.Evaluate(candidateParents[j], peer, taskTotalPieceCount)
-		},
-	)
-
+	candidateParents, err := sortNodes(candidateParents, s.evaluator, peer, taskTotalPieceCount)
+	if err != nil {
+		logger.Errorf("sort nodes error, error is %s", err.Error())
+		// Degrade to base evaluator
+		baseCompute(candidateParents, peer, taskTotalPieceCount)
+	}
 	peer.Log.Infof("find parent %s successful", candidateParents[0].ID)
 	return candidateParents[0], true
 }
@@ -249,8 +249,10 @@ func (s *scheduler) filterCandidateParents(peer *resource.Peer, blocklist set.Sa
 		candidateParents   []*resource.Peer
 		candidateParentIDs []string
 	)
-	for _, candidateParent := range peer.Task.LoadRandomPeers(uint(filterParentRangeLimit)) {
+	logger.Infof("there %v peer to be considered to add into graph", len(peer.Task.LoadRandomPeers(uint(filterParentRangeLimit))))
+	for id, candidateParent := range peer.Task.LoadRandomPeers(uint(filterParentRangeLimit)) {
 		// Parent length limit after filtering.
+		logger.Infof("%v candidate parent is %v", id, candidateParent.ID)
 		if len(candidateParents) >= filterParentLimit {
 			break
 		}
@@ -263,7 +265,7 @@ func (s *scheduler) filterCandidateParents(peer *resource.Peer, blocklist set.Sa
 
 		// Candidate parent can add edge with peer.
 		if !peer.Task.CanAddPeerEdge(candidateParent.ID, peer.ID) {
-			peer.Log.Debugf("can not add edge with candidate parent %s", candidateParent.ID)
+			peer.Log.Debugf("can not add edge with candidate parent %s, peerID is %s", candidateParent.ID, peer.ID)
 			continue
 		}
 
