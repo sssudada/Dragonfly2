@@ -41,3 +41,4 @@ then please add your team and use-case to this file.
 - [Yipitdata](https://www.yipitdata.com/) - Large-scale image and file distribution.
 - [ZTE](https://zte.com.cn/) - Large-scale image and file distribution.
 - [ZTO EXPRESS](https://www.zto.com/) - Large-scale image and file distribution.
+- [miHoYo](https://www.mihoyo.com/) - Large-scale image and file distribution.
